@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "dequantize.cuh"
 
 #include <cstdint>
 
@@ -577,6 +578,59 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// ============================================================
+// TurboQuant V-cache dequantize functions for flash attention
+// ============================================================
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+
+    const int64_t ib  = i0 / QK_TURBO3;
+    const int     iqs = (int)(i0 % QK_TURBO3) / 2;
+
+    static_assert(ne % 2 == 0, "bad ne");
+    T * dst_t = (T *) dst;
+
+#pragma unroll
+    for (int l = 0; l < ne/2; ++l) {
+        float2 v;
+        dequantize_turbo3_0(vx, ib, iqs + l, v);
+        if constexpr (std::is_same_v<T, half>) {
+            dst_t[2*l + 0] = __float2half(v.x);
+            dst_t[2*l + 1] = __float2half(v.y);
+        } else {
+            dst_t[2*l + 0] = (T)v.x;
+            dst_t[2*l + 1] = (T)v.y;
+        }
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
+
+    const int64_t ib  = i0 / QK_TURBO4;
+    const int     iqs = (int)(i0 % QK_TURBO4) / 2;
+
+    static_assert(ne % 2 == 0, "bad ne");
+    T * dst_t = (T *) dst;
+
+#pragma unroll
+    for (int l = 0; l < ne/2; ++l) {
+        float2 v;
+        dequantize_turbo4_0(vx, ib, iqs + l, v);
+        if constexpr (std::is_same_v<T, half>) {
+            dst_t[2*l + 0] = __float2half(v.x);
+            dst_t[2*l + 1] = __float2half(v.y);
+        } else {
+            dst_t[2*l + 0] = (T)v.x;
+            dst_t[2*l + 1] = (T)v.y;
+        }
+    }
+    GGML_UNUSED(x);
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -593,6 +647,12 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    // TurboQuant K-cache: Phase 1 - dequantize to FP16 before attention
+    // (use FP16 dot product after conversion in the dispatch layer)
+    } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
+        return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
+        return vec_dot_fattn_vec_KQ_f16<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -615,6 +675,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
+        return dequantize_V_turbo3_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
+        return dequantize_V_turbo4_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

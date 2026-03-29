@@ -132,6 +132,22 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
+        // TurboQuant requires head_dim=128 for the FWHT transform
+        if (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0) {
+            const uint32_t n_embd_head_k = hparams.n_embd_head_k(il);
+            if (n_embd_head_k != 128) {
+                LLAMA_LOG_ERROR("%s: TurboQuant requires head_dim=128, got %d (layer %d)\n", __func__, n_embd_head_k, il);
+                throw std::runtime_error("turbo types require head_dim=128");
+            }
+        }
+        if (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0) {
+            const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
+            if (n_embd_head_v != 128) {
+                LLAMA_LOG_ERROR("%s: TurboQuant requires head_dim=128, got %d (layer %d)\n", __func__, n_embd_head_v, il);
+                throw std::runtime_error("turbo types require head_dim=128");
+            }
+        }
+
         const bool has_k = true;
         const bool has_v = !is_mla;
 
