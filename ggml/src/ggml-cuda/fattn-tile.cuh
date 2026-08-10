@@ -431,9 +431,12 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 // tile, so the KV cache never has to be expanded to f16 beforehand.
 //
 // Rows are complete head_dim vectors here (the V tile is loaded with J = DV), so
-// each row is J/128 whole FWHT chunks. One warp decodes one chunk in registers
-// via turbo_decode_chunk_warp — no scratch shared memory, no block barrier, and
-// bit-identical to the bulk decode path.
+// each row is J/128 whole FWHT chunks. The tile is filled with RAW codebook
+// values scaled by norm/sqrt(128) — no rotation. Because H is linear and the
+// softmax weights are scalars, sum_j p_j H c_j = H (sum_j p_j c_j): the kernel
+// accumulates in the Hadamard domain and applies one inverse FWHT at the end,
+// instead of one per KV token. The transform is a dependency chain; the
+// accumulation is not, which is what makes this worth doing.
 //
 // KV is the raw block pointer; stride_KV_b is the row stride in bytes.
 template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check,
@@ -461,7 +464,9 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_turbo(
             float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             if (!oob) {
                 const block_t * row = (const block_t *) (KV + (size_t)i*stride_KV_b);
-                turbo_decode_chunk_warp<block_t>(row, (int64_t)c*TURBO_BLOCKS_PER_CHUNK_GPU, v, lane);
+                // Raw codebook values, no rotation: the accumulator stays in the
+                // Hadamard domain and is transformed once at the end of the kernel.
+                turbo_load_chunk_raw_warp<block_t>(row, (int64_t)c*TURBO_BLOCKS_PER_CHUNK_GPU, v, lane);
             }
 
             const int e0 = c*TURBO_HEAD_DIM_GPU + 4*lane;   // first element this lane owns
@@ -1085,6 +1090,60 @@ static __global__ void flash_attn_tile(
             }
 #endif // FAST_FP16_AVAILABLE
         }
+    }
+
+    // TurboQuant: the accumulator is still in the Hadamard domain. One inverse
+    // FWHT per 128-element chunk brings it back — once per launch, not once per
+    // KV token. Valid because H is linear and every scaling applied along the way
+    // (softmax rescaling, the 1/KQ_sum below) is a scalar: H(a*v) = a*H(v).
+    if constexpr (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0) {
+        static_assert(DV % TURBO_HEAD_DIM_GPU == 0, "turbo needs DV to be a multiple of 128");
+        static_assert(DVp == DV, "turbo assumes an unpadded V accumulator");
+
+        __syncthreads();   // KV_tmp is free from here on
+        float * fwht_buf = ((float *) KV_tmp) + threadIdx.y*DV;
+
+#pragma unroll
+        for (int jc0 = 0; jc0 < cpw; ++jc0) {
+#pragma unroll
+            for (int i0 = 0; i0 < DV/2; i0 += warp_size) {
+                const int idx = i0 + threadIdx.x;
+#ifdef FAST_FP16_AVAILABLE
+                const float2 t = __half22float2(VKQ[jc0*((DV/2)/warp_size) + i0/warp_size]);
+#else
+                const float2 t = VKQ[jc0*((DV/2)/warp_size) + i0/warp_size];
+#endif // FAST_FP16_AVAILABLE
+                fwht_buf[2*idx]     = t.x;
+                fwht_buf[2*idx + 1] = t.y;
+            }
+#ifdef GGML_USE_HIP
+            __builtin_amdgcn_wave_barrier();
+#else
+            __syncwarp();
+#endif
+
+#pragma unroll
+            for (int c = 0; c < DV/TURBO_HEAD_DIM_GPU; ++c) {
+                turbo_fwht_smem_128_warp<warp_size>(fwht_buf + c*TURBO_HEAD_DIM_GPU, threadIdx.x);
+            }
+
+#pragma unroll
+            for (int i0 = 0; i0 < DV/2; i0 += warp_size) {
+                const int idx = i0 + threadIdx.x;
+#ifdef FAST_FP16_AVAILABLE
+                VKQ[jc0*((DV/2)/warp_size) + i0/warp_size] = make_half2(fwht_buf[2*idx], fwht_buf[2*idx + 1]);
+#else
+                VKQ[jc0*((DV/2)/warp_size) + i0/warp_size].x = fwht_buf[2*idx];
+                VKQ[jc0*((DV/2)/warp_size) + i0/warp_size].y = fwht_buf[2*idx + 1];
+#endif // FAST_FP16_AVAILABLE
+            }
+#ifdef GGML_USE_HIP
+            __builtin_amdgcn_wave_barrier();
+#else
+            __syncwarp();
+#endif
+        }
+        __syncthreads();
     }
 
     // Write back results:

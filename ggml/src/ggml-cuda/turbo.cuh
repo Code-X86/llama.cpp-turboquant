@@ -218,6 +218,70 @@ static __device__ __forceinline__ void turbo_decode_chunk_smem_n(
 }
 
 // ------------------------------------------------------------
+// Warp-local FWHT over a 128-float shared-memory buffer
+// ------------------------------------------------------------
+//
+// Like turbo_fwht_smem_128_n but synchronizing only within the warp, so each
+// warp can transform its own buffer independently. Used once per kernel launch
+// to bring an accumulator back out of the Hadamard domain.
+
+template <int nthreads>
+static __device__ __forceinline__ void turbo_fwht_smem_128_warp(float * smem, int lane) {
+    for (int h = 1; h < TURBO_HEAD_DIM_GPU; h *= 2) {
+#pragma unroll
+        for (int b0 = 0; b0 < TURBO_HEAD_DIM_GPU/2; b0 += nthreads) {
+            const int b = b0 + lane;
+            if (nthreads > TURBO_HEAD_DIM_GPU/2 && b >= TURBO_HEAD_DIM_GPU/2) {
+                continue;
+            }
+            const int group = b / h;
+            const int pos   = b % h;
+            const int i     = group * h * 2 + pos;
+            const float a = smem[i];
+            const float c = smem[i + h];
+            smem[i]     = a + c;
+            smem[i + h] = a - c;
+        }
+#ifdef GGML_USE_HIP
+        __builtin_amdgcn_wave_barrier();
+#else
+        __syncwarp();
+#endif
+    }
+}
+
+// ------------------------------------------------------------
+// Raw chunk load: codebook values only, no transform
+// ------------------------------------------------------------
+//
+// For accumulating in the Hadamard domain. The caller applies one inverse FWHT
+// at the end instead of one per KV token — the whole point of the exercise, since
+// the transform is a dependency chain and the accumulation is not.
+//
+// Returns the chunk's codebook values already scaled by norm/sqrt(128), so the
+// downstream math is identical to decoded values apart from the missing rotation.
+
+template <typename block_t>
+static __device__ __forceinline__ void turbo_load_chunk_raw_warp(
+        const block_t * blocks, int64_t ib_chunk, float v[4], int lane) {
+    constexpr int bs = (sizeof(block_t) == sizeof(block_turbo3_0)) ? TURBO3_BLOCK_SIZE : TURBO4_BLOCK_SIZE;
+
+    const float scale = TURBO_FWHT_SCALE_GPU * __half2float(blocks[ib_chunk].d);
+
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int elem = 4*lane + r;
+        const int blk  = elem / bs;
+        const int eib  = elem % bs;
+        if constexpr (sizeof(block_t) == sizeof(block_turbo3_0)) {
+            v[r] = dc_codebook_3bit[turbo3_unpack_index((const block_turbo3_0 *)(blocks + ib_chunk + blk), eib)] * scale;
+        } else {
+            v[r] = dc_codebook_4bit[turbo4_unpack_index((const block_turbo4_0 *)(blocks + ib_chunk + blk), eib)] * scale;
+        }
+    }
+}
+
+// ------------------------------------------------------------
 // Chunk decode into registers (one warp per chunk)
 // ------------------------------------------------------------
 //
