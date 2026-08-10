@@ -212,6 +212,82 @@ per-token magnitude scaling — the mechanism does not exist here. The per-chunk
 normalization that makes TurboQuant expensive at runtime is the same property
 that makes it robust over long contexts.
 
+### Per-layer bit allocation
+
+Layers do not benefit equally from the extra bit. RateQuant (arXiv 2605.06675)
+derives an uneven allocation from a fitted distortion curve; the numbers below
+measure it directly instead, on Qwen3.5-9B (8 attention layers, 24 linear-attention
+layers with no KV cache).
+
+Each row upgrades exactly one layer to turbo4 and leaves the other seven on
+turbo3, against a 1.5337 all-turbo3 baseline:
+
+| layer | PPL | delta |
+|-------|-----|-------|
+| 0 | 1.5341 | +0.0004 |
+| 1 | 1.5338 | +0.0001 |
+| 2 | 1.5324 | -0.0013 |
+| 3 | 1.5325 | -0.0012 |
+| 4 | 1.5321 | -0.0016 |
+| 5 | 1.5330 | -0.0007 |
+| 6 | 1.5329 | -0.0008 |
+| 7 | 1.5326 | -0.0011 |
+
+Layer 0 gets *worse* with more bits, which is impossible and puts the noise floor
+at roughly +/-0.0005. Every individual number is therefore within one to three
+times the noise — far too weak to allocate bits from on its own.
+
+The ranking they form, however, is not. Two runs at an identical 4.0 bpw, differing
+only in which four layers are upgraded:
+
+| allocation | bpw | PPL |
+|------------|-----|-----|
+| all turbo3 | 3.500 | 1.5337 |
+| worst four (0,1,5,6) | 4.000 | 1.5322 |
+| best four (2,3,4,7) | 4.000 | 1.5292 |
+| all turbo4 | 4.500 | 1.5284 |
+
+0.0030 separates two configurations that cost exactly the same — six times the
+noise floor. The ranking carries real information even though the measurements it
+was built from individually do not; the errors partly cancel when sorting.
+
+Walking the ranking (best first: 4, 2, 3, 7, 6, 5, 0, 1) gives the quality/size
+curve:
+
+| upgraded layers | bpw | PPL | share of the turbo4 gain |
+|-----------------|-----|-----|--------------------------|
+| 0 | 3.500 | 1.5337 | 0% |
+| 2 | 3.750 | 1.5311 | 49% |
+| 3 | 3.875 | 1.5303 | 64% |
+| 4 | 4.000 | 1.5292 | 85% |
+| 6 | 4.250 | 1.5279 | 109% |
+| 8 | 4.500 | 1.5284 | 100% |
+
+Four of eight layers capture 85% of what all eight provide, at half the extra
+cost. Six reach full turbo4 quality at 4.25 bpw instead of 4.5.
+
+That six beat eight is 0.0005, exactly the noise floor, so the ordering between
+those two is not itself meaningful — but the two remaining layers are 0 and 1,
+the only two whose single-layer measurement came out positive. Two independent
+measurements agree that they gain nothing, which is worth more than either alone.
+
+Two useful operating points, then: 4.0 bpw for 85% of the gain, or 4.25 bpw for
+all of it — against 4.5 bpw for uniform turbo4.
+
+Set with `LLAMA_KV_TYPE_PER_LAYER`, a comma-separated ggml type name per KV layer
+(K and V get the same type). Fewer entries than layers: the last one applies to
+the remainder, with a warning.
+
+```bash
+# best four layers of Qwen3.5-9B at turbo4, rest at turbo3 (4.0 bpw average)
+LLAMA_KV_TYPE_PER_LAYER=turbo3,turbo3,turbo4,turbo4,turbo4,turbo3,turbo3,turbo4 \
+  llama-cli -m model.gguf -fa on --cache-type-k turbo3 --cache-type-v turbo3
+```
+
+The ranking is model-specific — it was measured on this model and should not be
+assumed to transfer. Reproduce it for another model by upgrading one layer at a
+time, as above.
+
 ### KV Cache Memory
 
 | KV Type | Bytes per element | Savings vs f16 |
