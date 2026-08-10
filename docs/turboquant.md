@@ -122,13 +122,36 @@ codebook lookups more than consume. No amount of tuning inside the vector kernel
 recovers this; a fused kernel has to support GQA to beat the tile path.
 
 Therefore **disabled by default**. Enable with `GGML_CUDA_TURBO_FUSED_FA=1`.
-The useful next step is not micro-optimization but a fused tile kernel — see
-`fattn-tile.cuh:663`, where each row of the V tile is already a complete,
-contiguous head_dim vector in shared memory, next to an existing `__syncthreads()`.
-Smaller leads if the vector kernel is revisited anyway: hold the codebook
-lane-resident and read it via `__shfl_sync` instead of memory, and check whether
-the XOR-16 shuffle stage lowers to `ds_bpermute` (it crosses the DPP16 row
-boundary on RDNA 4).
+
+### Fused tile V path: also no gain
+
+The tile kernel is what f16 actually uses for decode with GQA, and its V tile
+holds complete contiguous head_dim rows, so decoding there avoids the vector
+kernel's GQA penalty entirely. That path exists too (`type_V` threaded through
+`flash_attn_tile`, `flash_attn_tile_load_tile_turbo`, `need_f16_V = false`) and
+is correct — 640/640 on both turbo types. It does not help either, at depth 65536:
+
+| config | bulk | fused V |
+|--------|------|---------|
+| f16 / turbo3 | 31.46 | 31.08 |
+| turbo3 / turbo3 | 23.58 | 23.54 |
+
+Traffic does drop from 2 to 0.4375 bytes per element. The kernel is not waiting
+on that. The original tile load is a plain copy, fully pipelined across all
+threads; decoding instead walks chunk by chunk through an FWHT whose five shuffle
+stages form a dependency chain. It is latency-bound, not bandwidth-bound.
+
+**Conclusion after two independent attempts:** TurboQuant decoding is too
+expensive to perform inside attention. The bulk conversion amortizes it over the
+whole cache once per FA call, which neither a vector nor a tile kernel can match
+by decoding on demand. The fused tile V path is kept because it removes the f16
+staging buffer for V (~128 MB at 65536 context) at no throughput cost.
+
+If this is revisited, the thing to attack is the decode cost itself, not where it
+runs: hold the codebook lane-resident and read it via `__shfl_sync` instead of
+memory, and check whether the XOR-16 shuffle stage lowers to `ds_bpermute` (it
+crosses the DPP16 row boundary on RDNA 4). Both target the dependency chain that
+makes decoding slow in the first place.
 
 ### Perplexity (lower is better)
 
