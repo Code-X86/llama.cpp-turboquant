@@ -59,22 +59,22 @@ jobs:
   cuda:
     name: CUDA compile check
     runs-on: ubuntu-latest
+    # Same approach as the upstream ubuntu-latest-cuda job. Installing the toolkit
+    # onto a bare runner does not work: the cuda-12-6 meta-package depends on the
+    # NVIDIA kernel driver, which cannot build there, and dpkg then fails the whole
+    # install. A devel image ships nvcc and cuBLAS and needs no driver at all —
+    # correct for a compile-only check.
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
     steps:
       - uses: actions/checkout@v4
 
-      - uses: Jimver/cuda-toolkit@v0.2.19
-        id: cuda-toolkit
-        with:
-          cuda: "12.6.2"
-          method: network
-          # No sub-packages filter: ggml-cuda needs cuBLAS in addition to nvcc and
-          # the runtime, and guessing package names cost two failed runs. A full
-          # install is slower but does not break on naming.
-
       - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        # No sudo: the container runs as root.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake
+          apt-get update
+          apt-get install -y build-essential cmake git libgomp1
 
       - name: Configure
         run: |
@@ -82,6 +82,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_CUDA=ON \
             -DCMAKE_CUDA_ARCHITECTURES=75 \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_FATAL_WARNINGS=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_SERVER=OFF
