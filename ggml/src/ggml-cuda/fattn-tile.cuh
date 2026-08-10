@@ -485,6 +485,66 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_turbo(
     }
 }
 
+// TurboQuant K tile: raw codebook values scaled by norm/sqrt(128), no rotation.
+//
+// Unlike the V tile this loads a *slice* of each row — nbatch_K is 64 at the head
+// sizes turbo supports, half a chunk. That is fine here: the KQ dot is
+// element-wise, so it never needs a whole chunk at once. It only requires Q to
+// have been transformed into the Hadamard domain beforehand, since
+// <H c, q> = <c, H q>.
+//
+// A slice never straddles a chunk boundary (nbatch_K divides 128 and elem_off is
+// a multiple of nbatch_K), so the norm is one load per row.
+template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check,
+         typename block_t, typename tile_t>
+static __device__ __forceinline__ void flash_attn_tile_load_tile_turbo_k(
+        const char * const __restrict__ KV, tile_t * const __restrict__ tile_KV,
+        const int stride_KV_b, const int i_sup, const int elem_off) {
+    constexpr int bs = (sizeof(block_t) == sizeof(block_turbo3_0)) ? TURBO3_BLOCK_SIZE : TURBO4_BLOCK_SIZE;
+    constexpr int nthreads = warp_size*nwarps;
+
+    const int tid   = warp_size*threadIdx.y + threadIdx.x;
+    const int chunk = elem_off / TURBO_HEAD_DIM_GPU;
+    const int eoff  = elem_off % TURBO_HEAD_DIM_GPU;   // offset inside the chunk
+
+    // Work in pairs so a single thread owns both halves of a half2 slot; letting
+    // two threads write the two halves would be a read-modify-write race.
+    constexpr int JP = std::is_same<tile_t, half2>::value ? J/2 : J;
+
+#pragma unroll
+    for (int idx0 = 0; idx0 < I*JP; idx0 += nthreads) {
+        const int idx = idx0 + tid;
+        if (I*JP % nthreads != 0 && idx >= I*JP) {
+            continue;
+        }
+        const int i  = idx / JP;
+        const int jp = idx % JP;
+
+        const bool live = !oob_check || i < i_sup;
+        const block_t * row = (const block_t *) (KV + (size_t)i*stride_KV_b);
+        const int64_t   ib0 = (int64_t)chunk * TURBO_BLOCKS_PER_CHUNK_GPU;
+        const float     nrm = live ? TURBO_FWHT_SCALE_GPU * __half2float(row[ib0].d) : 0.0f;
+
+        auto fetch = [&] __device__ (const int j) -> float {
+            if (!live) {
+                return 0.0f;
+            }
+            const int e = eoff + j;
+            if constexpr (sizeof(block_t) == sizeof(block_turbo3_0)) {
+                return dc_codebook_3bit[turbo3_unpack_index((const block_turbo3_0 *)(row + ib0 + e/bs), e % bs)] * nrm;
+            } else {
+                return dc_codebook_4bit[turbo4_unpack_index((const block_turbo4_0 *)(row + ib0 + e/bs), e % bs)] * nrm;
+            }
+        };
+
+        if constexpr (std::is_same<tile_t, half2>::value) {
+            tile_KV[i*(J/2 + J_padding) + jp] = make_half2(fetch(2*jp), fetch(2*jp + 1));
+        } else {
+            tile_KV[i*(J + J_padding) + jp] = fetch(jp);
+        }
+    }
+}
+
 // Function that performs a single iteration in for the KQ matrix multiplication:
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int nbatch_fa, int nbatch_K,
     bool use_logit_softcap, bool oob_check, typename T_vec_dot>
