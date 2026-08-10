@@ -187,11 +187,14 @@ number can understate the real cost. Measured against that concern:
 |---------|-----|--------|-------|--------|-------|
 | 2048 | 1.5258 | 1.5276 | +0.0018 | 1.5338 | +0.0080 |
 | 8192 | 1.4107 | 1.4124 | +0.0017 | 1.4172 | +0.0065 |
-| 16384 | 1.3431 | not measured | — | not measured | — |
+| 16384 | 1.3431 | not measured | — | 1.3497 | +0.0066 |
 
-The gap does not widen — for turbo3 it narrows slightly, in absolute and in
-relative terms (0.52% -> 0.46%). Two depths is a thin basis for a trend, but it
-is enough to rule out the failure mode the paper describes.
+The gap does not widen. For turbo3 it drops from +0.0080 at 2048 to +0.0065 at
+8192 and then holds at +0.0066 through 16384 — 0.52%, 0.46%, 0.49% in relative
+terms. Three depths across an 8x range, flat after the first step.
+
+(turbo4 at 16384 is missing; its delta is ~0.0017 at both measured depths, small
+enough that the trend question hardly applies.)
 
 That is consistent with how TurboQuant stores data: the per-chunk L2 norm is kept
 in fp16 and never quantized, so only the *direction* of the normalized vector is
