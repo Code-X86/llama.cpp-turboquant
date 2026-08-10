@@ -3,6 +3,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
+#include "fattn-vec-turbo.cuh"
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 #include "convert.cuh"
@@ -508,8 +509,72 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+// The fused turbo kernel decodes TurboQuant blocks inside flash attention instead
+// of expanding the whole KV cache to f16 first. It covers the decode case only
+// (ncols <= 2); everything else falls back to the tile/MMA path, which converts
+// via launch_fattn.
+static bool ggml_cuda_fattn_turbo_fused_applies(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    if (!K || !V) {
+        return false;
+    }
+    if (!ggml_type_is_turbo(K->type) || K->type != V->type) {
+        return false;  // mixed turbo/f16 has no instance
+    }
+    if (Q->ne[0] != K->ne[0] || Q->ne[0] != V->ne[0]) {
+        return false;
+    }
+    if (Q->ne[0] != 128 && Q->ne[0] != 256) {
+        return false;
+    }
+    if (Q->ne[1] > 2) {
+        return false;  // prompt processing: not a vector-kernel shape
+    }
+    // Like the generic vector kernel, this one consumes whole nthreads-sized
+    // blocks of KV without a tail check, so the KV length has to be padded.
+    if (K->ne[1] % FATTN_KQ_STRIDE != 0) {
+        return false;
+    }
+
+    // Escape hatch for the field.
+    static const bool disabled = getenv("GGML_CUDA_TURBO_FUSED_FA_OFF") != nullptr;
+    return !disabled;
+}
+
+static void ggml_cuda_flash_attn_ext_vec_turbo(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+
+    switch (Q->ne[0]) {
+        case 128:
+            if (K->type == GGML_TYPE_TURBO3_0) {
+                ggml_cuda_flash_attn_ext_vec_turbo_case<128, GGML_TYPE_TURBO3_0>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_vec_turbo_case<128, GGML_TYPE_TURBO4_0>(ctx, dst);
+            }
+            break;
+        case 256:
+            if (K->type == GGML_TYPE_TURBO3_0) {
+                ggml_cuda_flash_attn_ext_vec_turbo_case<256, GGML_TYPE_TURBO3_0>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_vec_turbo_case<256, GGML_TYPE_TURBO4_0>(ctx, dst);
+            }
+            break;
+        default:
+            GGML_ABORT("unsupported head size for fused turbo FA");
+    }
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    if (ggml_cuda_fattn_turbo_fused_applies(dst)) {
+        ggml_cuda_flash_attn_ext_vec_turbo(ctx, dst);
+        return;
+    }
 
     // Turbo KV needs no special handling here: the tile/MMA/WMMA kernels all pass
     // need_f16_K/V = true, so launch_fattn converts them via ggml_get_to_fp16_cuda
