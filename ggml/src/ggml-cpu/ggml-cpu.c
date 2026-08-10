@@ -393,6 +393,24 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
     },
+    // TurboQuant: KV-cache only. vec_dot takes f32 on the right-hand side and
+    // dequantizes the left-hand side internally (inverse FWHT + norm), so
+    // vec_dot_type is F32. Without these entries the CPU flash-attention path
+    // calls a null vec_dot pointer, which is what test-backend-ops hits when it
+    // computes its CPU reference.
+    // No .from_float: quantize_row_turbo*_ref asserts k % 128 == 0, which the
+    // generic per-block callers do not honor. Quantization goes through
+    // ggml_quantize_chunk instead.
+    [GGML_TYPE_TURBO3_0] = {
+        .vec_dot                  = ggml_vec_dot_turbo3_0,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO4_0] = {
+        .vec_dot                  = ggml_vec_dot_turbo4_0,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
 };
 
 const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type) {
