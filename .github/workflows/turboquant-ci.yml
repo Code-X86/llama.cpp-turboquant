@@ -67,7 +67,8 @@ jobs:
         with:
           cuda: "12.6.2"
           method: network
-          sub-packages: '["nvcc", "cudart-dev"]'
+          # ggml-cuda links against cuBLAS, so nvcc and the runtime alone are not enough.
+          sub-packages: '["nvcc", "cudart-dev", "cublas", "cublas-dev"]'
 
       - name: Install dependencies
         run: |
