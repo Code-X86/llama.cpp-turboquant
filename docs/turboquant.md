@@ -67,6 +67,14 @@ where the Lloyd-Max codebook is optimal. The codebook centroids are precomputed
 for the Beta((d-1)/2, (d-1)/2) distribution that arises after FWHT of unit vectors
 in d=128 dimensions.
 
+The transform is always applied in fixed 128-element chunks, walking the row.
+A head larger than 128 is therefore split into independently normalized chunks:
+a 256-dim head (Qwen3.5) becomes two halves, each with its own L2 norm and its
+own FWHT. Because every normalized half is again a unit vector in R^128, the
+same codebooks stay optimal — no per-head-size codebook is needed. The stored
+norm is already replicated per 32-element block, so the extra half-norm costs
+no additional bytes and the bit rate is unchanged.
+
 Current implementation uses a pre-dequantize strategy: turbo KV data is bulk-converted
 to f16 before standard Flash Attention runs. This adds minimal overhead (~3% pp, ~8% tg)
 while avoiding the complexity of a fused FA kernel.
@@ -74,12 +82,14 @@ while avoiding the complexity of a fused FA kernel.
 ## Requirements
 
 - Flash Attention enabled (`-fa 1`)
-- head_dim = 128 (covers Llama, Qwen, Mistral, Gemma, and most current models)
+- head_dim must be a multiple of 128 — 128 covers Llama, Qwen3, Mistral and
+  Gemma; 256 covers Qwen3.5
 - AMD ROCm (gfx1201 tested) or CPU
 
 ## Limitations
 
-- head_dim must be exactly 128 (FWHT requirement)
+- head_dim must be a multiple of 128 (FWHT chunk size). Models with head_dim
+  80, 96 or 112 are not supported.
 - Mixed turbo/quantized combinations (e.g. turbo4/q8_0) are not supported — use turbo/turbo or turbo/f16
 - No CUDA support yet (HIP/ROCm only for GPU path)
 - Pre-dequantize strategy means full KV cache is converted to f16 per FA call (a fused kernel would eliminate this)
