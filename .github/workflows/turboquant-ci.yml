@@ -35,6 +35,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential cmake ccache
 
+      - uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: turboquant-ci-cpu
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
       - name: Configure
         run: |
           cmake -B build \
@@ -75,6 +81,16 @@ jobs:
         run: |
           apt-get update
           apt-get install -y build-essential cmake git libgomp1
+
+      # ggml's CMake picks ccache up automatically once the binary exists, so this
+      # only has to provide the cache. It matters here more than anywhere else:
+      # ggml-cuda is 131 translation units, and nvcc compiles each one several
+      # times over (PTX, SASS, host). Must run before Configure.
+      - uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: turboquant-ci-cuda
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
       - name: Configure
         run: |
