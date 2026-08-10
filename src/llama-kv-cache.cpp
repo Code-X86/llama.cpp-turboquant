@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 
 //
@@ -99,6 +100,51 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // Experimental: per-layer KV types via LLAMA_KV_TYPE_PER_LAYER.
+    //
+    // Rate-distortion work on KV caches (RateQuant, arXiv 2605.06675) shows that
+    // spending the same average bit budget unevenly across layers beats spending
+    // it uniformly, because the distortion-vs-bits curve differs per layer. The
+    // cache already supports this structurally — tensors are created per layer
+    // below and every consumer reads the type off the tensor — so this only needs
+    // a way to say which layer gets what.
+    //
+    // Format: comma-separated ggml type names, one per KV layer, in order.
+    // Example: LLAMA_KV_TYPE_PER_LAYER=turbo4,turbo3,turbo3,turbo3,turbo3,turbo3,turbo3,turbo4
+    // Fewer entries than layers: the last one is repeated. Unset: type_k/type_v
+    // apply everywhere, as before.
+    std::vector<ggml_type> types_per_layer;
+    if (const char * spec = getenv("LLAMA_KV_TYPE_PER_LAYER")) {
+        std::istringstream ss(spec);
+        std::string name;
+        while (std::getline(ss, name, ',')) {
+            const size_t first = name.find_first_not_of(" \t");
+            if (first == std::string::npos) {
+                continue;
+            }
+            name = name.substr(first, name.find_last_not_of(" \t") - first + 1);
+
+            ggml_type found = GGML_TYPE_COUNT;
+            for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                if (name == ggml_type_name((ggml_type) t)) {
+                    found = (ggml_type) t;
+                    break;
+                }
+            }
+            if (found == GGML_TYPE_COUNT) {
+                LLAMA_LOG_ERROR("%s: LLAMA_KV_TYPE_PER_LAYER: unknown type '%s'\n", __func__, name.c_str());
+                throw std::runtime_error("unknown KV type in LLAMA_KV_TYPE_PER_LAYER");
+            }
+            types_per_layer.push_back(found);
+        }
+        if (!types_per_layer.empty()) {
+            LLAMA_LOG_INFO("%s: per-layer KV types active (%d entries)\n", __func__, (int) types_per_layer.size());
+        }
+    }
+
+    // Index into types_per_layer, counted over layers that actually have a cache.
+    uint32_t kv_layer_idx = 0;
+
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -132,18 +178,29 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
+        ggml_type type_k_il = type_k;
+        ggml_type type_v_il = type_v;
+        if (!types_per_layer.empty()) {
+            const size_t idx = std::min<size_t>(kv_layer_idx, types_per_layer.size() - 1);
+            type_k_il = types_per_layer[idx];
+            type_v_il = types_per_layer[idx];
+            LLAMA_LOG_DEBUG("%s: layer %3d: KV type %s\n", __func__, il, ggml_type_name(type_k_il));
+        }
+        kv_layer_idx++;
+
         // TurboQuant applies the FWHT in fixed 128-element chunks, so head_dim
         // must be a multiple of 128. A 256-dim head is quantized as two
         // independently normalized halves — each half is a unit vector in R^128,
         // which is the distribution the codebooks were fitted for.
-        if (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0) {
+        // Checked against the effective per-layer type, not the global one.
+        if (type_k_il == GGML_TYPE_TURBO3_0 || type_k_il == GGML_TYPE_TURBO4_0) {
             const uint32_t n_embd_head_k = hparams.n_embd_head_k(il);
             if (n_embd_head_k % 128 != 0) {
                 LLAMA_LOG_ERROR("%s: TurboQuant requires head_dim to be a multiple of 128, got %d (layer %d)\n", __func__, n_embd_head_k, il);
                 throw std::runtime_error("turbo types require head_dim to be a multiple of 128");
             }
         }
-        if (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0) {
+        if (type_v_il == GGML_TYPE_TURBO3_0 || type_v_il == GGML_TYPE_TURBO4_0) {
             const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
             if (n_embd_head_v % 128 != 0) {
                 LLAMA_LOG_ERROR("%s: TurboQuant requires head_dim to be a multiple of 128, got %d (layer %d)\n", __func__, n_embd_head_v, il);
@@ -154,8 +211,8 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k_il, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v_il, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -171,6 +228,15 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+    }
+
+    // A count mismatch is almost always a mistake — a list written for a different
+    // model, or one that forgot that only some layers have a KV cache. Repeating
+    // the last entry keeps it working, but silently, so say so.
+    if (!types_per_layer.empty() && types_per_layer.size() != kv_layer_idx) {
+        LLAMA_LOG_WARN("%s: LLAMA_KV_TYPE_PER_LAYER has %d entries but this model has %d KV layers; "
+                       "the last entry applies to the remainder\n",
+                       __func__, (int) types_per_layer.size(), (int) kv_layer_idx);
     }
 
     if (reuse) {
