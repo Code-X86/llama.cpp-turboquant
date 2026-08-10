@@ -3,6 +3,8 @@
 #include "common.cuh"
 #include "dequantize.cuh"
 
+#include <type_traits>
+
 // ============================================================
 // TurboQuant shared building blocks
 // ============================================================

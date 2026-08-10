@@ -1,0 +1,92 @@
+# CI for this fork.
+#
+# The upstream workflows assume infrastructure a fork does not have (self-hosted
+# runners for ggml-ci, signing secrets, Apple/Windows matrices), so they fail for
+# reasons unrelated to the code. This one checks what actually matters here:
+# the TurboQuant code builds on CPU and on CUDA, and its tests pass.
+#
+# The CUDA job is compile-only — the runners have no GPU. That is still the job
+# that matters most: TurboQuant is developed against HIP, and HIP/clang pulls in
+# headers NVCC does not, so CUDA-only compile errors are the realistic failure
+# mode here.
+
+name: TurboQuant CI
+
+on:
+  push:
+    branches: [master, "feat/**"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    name: CPU build + TurboQuant tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ccache
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DGGML_NATIVE=OFF
+
+      - name: Build
+        run: cmake --build build --target test-turboquant test-backend-ops -j $(nproc)
+
+      - name: TurboQuant CPU reference tests
+        run: ./build/bin/test-turboquant
+
+      # The CPU backend is the reference backend, so test-backend-ops has nothing
+      # to compare against here. Run it anyway: it still exercises tensor setup
+      # and quantization, which is where two of the fixed bugs lived.
+      - name: Backend ops (setup + quantization paths)
+        run: ./build/bin/test-backend-ops -o FLASH_ATTN_EXT
+
+  cuda:
+    name: CUDA compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit
+        with:
+          cuda: "12.6.2"
+          method: network
+          # No sub-packages filter: ggml-cuda needs cuBLAS in addition to nvcc and
+          # the runtime, and guessing package names cost two failed runs. A full
+          # install is slower but does not break on naming.
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=75 \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_SERVER=OFF
+
+      # Only the ggml-cuda target: the TurboQuant kernels live there, and a full
+      # build would take far longer without checking anything additional.
+      - name: Build ggml-cuda
+        run: cmake --build build --target ggml-cuda -j $(nproc)
