@@ -41,6 +41,16 @@ static constexpr __device__ int ggml_cuda_fattn_vec_turbo_nthreads() {
     return 128;
 }
 
+// Ordering fence within a warp. The lanes run in lockstep, so no data movement is
+// needed — this only stops the compiler from sinking loads across the point.
+static __device__ __forceinline__ void turbo_warp_fence() {
+#ifdef GGML_USE_HIP
+    __builtin_amdgcn_wave_barrier();
+#else
+    __syncwarp();
+#endif
+}
+
 template<int D, int ncols, ggml_type type_KV, bool use_logit_softcap>
 __launch_bounds__(ggml_cuda_fattn_vec_turbo_nthreads(), 1)
 static __global__ void flash_attn_ext_vec_turbo(
@@ -97,26 +107,53 @@ static __global__ void flash_attn_ext_vec_turbo(
     __shared__ float KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
 
     // --- Q into the Hadamard domain, once per launch ---
-    // Every warp keeps its own copy; that costs a few registers but avoids a
-    // block-wide barrier in the hot loop.
-    float Q_h[ncols][nchunks][4];
+    //
+    // Two different lane layouts are needed here. turbo_fwht_warp_128 requires 4
+    // consecutive elements per lane (that is what makes the butterfly stages
+    // register-local). The KQ dot wants the opposite: as few lanes per token as
+    // possible, because each token costs one warp reduction. With nthreads_KQ
+    // lanes per token, a reduction is log2(nthreads_KQ) stages instead of 5, and
+    // nthreads/nthreads_KQ tokens are processed at once.
+    //
+    // So: transform in the 4-per-lane layout, then redistribute through shared
+    // memory into E = D/nthreads_KQ consecutive elements per lane. At E=16 the
+    // 3-bit indices of a turbo3 block also land on byte boundaries (16*3 = 48
+    // bit = 6 byte), which keeps the unpacking cheap.
+    constexpr int nthreads_KQ  = 8;
+    constexpr int E            = D / nthreads_KQ;          // elements per lane in the dot
+    constexpr int toks_per_it  = WARP_SIZE / nthreads_KQ;  // tokens handled simultaneously
+
+    const int lane_KQ = lane % nthreads_KQ;   // which slice of the head this lane dots
+    const int tok_KQ  = lane / nthreads_KQ;   // which of the concurrent tokens
+
+    float Q_dot[ncols][E];
+    {
+        float * Qs = KQ + threadIdx.y*D;   // per-warp scratch, no cross-warp barrier
 #pragma unroll
-    for (int j = 0; j < ncols; ++j) {
-        const float * Q_j = (const float *) (Q + j*nb01);
+        for (int j = 0; j < ncols; ++j) {
+            const float * Q_j = (const float *) (Q + j*nb01);
 #pragma unroll
-        for (int c = 0; c < nchunks; ++c) {
+            for (int c = 0; c < nchunks; ++c) {
+                float qh[4];
 #pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                const int i = c*TURBO_HEAD_DIM_GPU + 4*lane + r;
-                Q_h[j][c][r] = (ncols == 1 || ic0 + j < int(ne01.z)) ? Q_j[i] : 0.0f;
+                for (int r = 0; r < 4; ++r) {
+                    const int i = c*TURBO_HEAD_DIM_GPU + 4*lane + r;
+                    qh[r] = (ncols == 1 || ic0 + j < int(ne01.z)) ? Q_j[i] : 0.0f;
+                }
+                turbo_fwht_warp_128(qh, lane);
+                // Fold in the attention scale and the decode-side 1/sqrt(128) here
+                // so the inner loop only multiplies by the per-chunk norm.
+#pragma unroll
+                for (int r = 0; r < 4; ++r) {
+                    Qs[c*TURBO_HEAD_DIM_GPU + 4*lane + r] = qh[r] * scale * TURBO_FWHT_SCALE_GPU;
+                }
             }
-            turbo_fwht_warp_128(Q_h[j][c], lane);
-            // Fold in the attention scale and the decode-side 1/sqrt(128) here so
-            // the inner loop only multiplies by the per-chunk norm.
+            turbo_warp_fence();
 #pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                Q_h[j][c][r] *= scale * TURBO_FWHT_SCALE_GPU;
+            for (int e = 0; e < E; ++e) {
+                Q_dot[j][e] = Qs[lane_KQ*E + e];
             }
+            turbo_warp_fence();
         }
     }
 
@@ -139,7 +176,10 @@ static __global__ void flash_attn_ext_vec_turbo(
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
         // --- logits: warp y handles KV tokens [y*WARP_SIZE, (y+1)*WARP_SIZE) ---
-        float KQ_reg[ncols];
+        //
+        // toks_per_it tokens at a time, nthreads_KQ lanes each. Each lane covers
+        // E consecutive elements, which is one chunk's worth or less, so the
+        // per-chunk norm is a single load per lane per token.
         float KQ_max_new[ncols];
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
@@ -147,47 +187,44 @@ static __global__ void flash_attn_ext_vec_turbo(
         }
 
 #pragma unroll
-        for (int i_KQ_0 = 0; i_KQ_0 < WARP_SIZE; ++i_KQ_0) {
-            const int i_KQ = threadIdx.y*WARP_SIZE + i_KQ_0;
+        for (int i_KQ_0 = 0; i_KQ_0 < WARP_SIZE; i_KQ_0 += toks_per_it) {
+            const int i_KQ = threadIdx.y*WARP_SIZE + i_KQ_0 + tok_KQ;
 
             const block_t * Kb = (const block_t *) (K + i_KQ*nb11);
 
-            // Codebook dot in the Hadamard domain, per chunk.
+            // E is a divisor of the 128-element chunk, so a lane's slice never
+            // straddles a chunk boundary: one norm, fetched once.
+            const int      elem0 = lane_KQ*E;
+            const int      chunk = elem0 / TURBO_HEAD_DIM_GPU;
+            const int64_t  ib0   = (int64_t)chunk * TURBO_BLOCKS_PER_CHUNK_GPU;
+            const float    norm  = __half2float(Kb[ib0].d);
+
             float sum[ncols];
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 sum[j] = 0.0f;
             }
 #pragma unroll
-            for (int c = 0; c < nchunks; ++c) {
-                const int64_t ib = (int64_t)c * TURBO_BLOCKS_PER_CHUNK_GPU;
-                float cb[4];
-#pragma unroll
-                for (int r = 0; r < 4; ++r) {
-                    const int elem = 4*lane + r;
-                    const int blk  = elem / 32;
-                    const int eib  = elem % 32;
-                    if constexpr (type_KV == GGML_TYPE_TURBO3_0) {
-                        cb[r] = dc_codebook_3bit[turbo3_unpack_index(Kb + ib + blk, eib)];
-                    } else {
-                        cb[r] = dc_codebook_4bit[turbo4_unpack_index(Kb + ib + blk, eib)];
-                    }
+            for (int e = 0; e < E; ++e) {
+                const int elem = elem0 + e;
+                const int eic  = elem % TURBO_HEAD_DIM_GPU;   // element within the chunk
+                const int blk  = eic / 32;
+                const int eib  = eic % 32;
+                float cb;
+                if constexpr (type_KV == GGML_TYPE_TURBO3_0) {
+                    cb = dc_codebook_3bit[turbo3_unpack_index(Kb + ib0 + blk, eib)];
+                } else {
+                    cb = dc_codebook_4bit[turbo4_unpack_index(Kb + ib0 + blk, eib)];
                 }
-                const float norm = __half2float(Kb[ib].d);
 #pragma unroll
                 for (int j = 0; j < ncols; ++j) {
-                    float partial = 0.0f;
-#pragma unroll
-                    for (int r = 0; r < 4; ++r) {
-                        partial += cb[r] * Q_h[j][c][r];
-                    }
-                    sum[j] += partial * norm;
+                    sum[j] += cb * Q_dot[j][e];
                 }
             }
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                sum[j] = warp_reduce_sum<WARP_SIZE>(sum[j]);
+                sum[j] = warp_reduce_sum<nthreads_KQ>(sum[j]) * norm;
 
                 if (use_logit_softcap) {
                     sum[j] = logit_softcap * tanhf(sum[j]);
@@ -202,11 +239,15 @@ static __global__ void flash_attn_ext_vec_turbo(
                 // masked out; without it expf(-inf - -inf) yields NaN.
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum[j] + FATTN_KQ_MAX_OFFSET);
 
-                if (uint32_t(i_KQ_0) == threadIdx.x) {   // one lane keeps each token's logit
-                    KQ_reg[j] = sum[j];
+                if (lane_KQ == 0) {
+                    KQ[j*nthreads + threadIdx.y*WARP_SIZE + i_KQ_0 + tok_KQ] = sum[j];
                 }
             }
         }
+
+        // The logits were written by lane_KQ == 0 of each group and are read back
+        // by every lane below; both happen inside one warp.
+        turbo_warp_fence();
 
         // --- online softmax rescale ---
 #pragma unroll
@@ -215,9 +256,10 @@ static __global__ void flash_attn_ext_vec_turbo(
             const float KQ_max_scale = expf(KQ_max[j] - KQ_max_new[j]);
             KQ_max[j] = KQ_max_new[j];
 
-            KQ_reg[j] = expf(KQ_reg[j] - KQ_max[j]);
-            KQ_sum[j] = KQ_sum[j]*KQ_max_scale + KQ_reg[j];
-            KQ[j*nthreads + tid] = KQ_reg[j];
+            // Every lane owns exactly one token's logit at this point.
+            const float p = expf(KQ[j*nthreads + tid] - KQ_max[j]);
+            KQ_sum[j] = KQ_sum[j]*KQ_max_scale + p;
+            KQ[j*nthreads + tid] = p;
 
             // Rescaling in the Hadamard domain is exact: H(a*v) = a*H(v).
 #pragma unroll

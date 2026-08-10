@@ -98,23 +98,37 @@ replace two per KV token.
 It is correct (test-backend-ops FLASH_ATTN_EXT: turbo3 640/640, turbo4 640/640)
 but **slower than the path it replaces**, measured A/B in the same build:
 
-| depth | fused | bulk conversion | f16 |
-|-------|-------|-----------------|-----|
-| 0 | 52.5 | 55.0 | 56.8 |
-| 16384 | 35.7 | 42.5 | 54.1 |
-| 65536 | **16.6** | **23.6** | **46.9** |
+| depth | fused (KQ=32) | fused (KQ=8) | bulk conversion | f16 |
+|-------|--------------|-------------|-----------------|-----|
+| 0 | 52.5 | 53.2 | 55.0 | 56.8 |
+| 16384 | 35.7 | 39.2 | 42.5 | 54.1 |
+| 65536 | 16.6 | **20.4** | **23.6** | **46.9** |
 
-It saves memory bandwidth but pays for it in per-token work: unpacking 3-bit
-indices across byte boundaries and looking up codebook entries. On AMD a
-`__constant__` array is a real vector load, not a broadcast from a constant
-bank, so each lane issues 4 loads per KV token per chunk. That cost apparently
-outweighs the bandwidth saved — plausible but not verified; an ISA-level look at
-the generated loads and the cross-lane shuffles would be the next step.
+Narrowing the KQ reduction from 32 lanes per token to 8 (one warp reduction is
+then 3 stages instead of 5, and 4 tokens are dotted at once) bought 23% at depth
+65536. It does not close the gap, because the remaining cause is structural:
+
+**GQA amortization.** For `Q->ne[1] == 1` with `gqa_opt_applies`, f16 does not
+use the vector kernel at all — `fattn.cu` routes it to the tile kernel, which
+processes all `gqa_ratio` query heads per KV read. The fused vector kernel
+handles one query head per block and therefore reads K and V `gqa_ratio` times
+as often. Per element and query head, with Qwen3.5's gqa_ratio = 4:
+
+    tile + f16:     2 bytes / 4 heads = 0.50 bytes
+    fused + turbo3: 0.4375 bytes x 1  = 0.4375 bytes
+
+The 4.57x compression collapses to a 12% bandwidth edge, which the unpacking and
+codebook lookups more than consume. No amount of tuning inside the vector kernel
+recovers this; a fused kernel has to support GQA to beat the tile path.
 
 Therefore **disabled by default**. Enable with `GGML_CUDA_TURBO_FUSED_FA=1`.
-Ideas worth trying before revisiting: keep the codebook lane-resident and read it
-via `__shfl_sync` instead of memory, and check whether the XOR-16 shuffle stage
-compiles to `ds_bpermute` (it crosses the DPP16 row boundary on RDNA 4).
+The useful next step is not micro-optimization but a fused tile kernel — see
+`fattn-tile.cuh:663`, where each row of the V tile is already a complete,
+contiguous head_dim vector in shared memory, next to an existing `__syncthreads()`.
+Smaller leads if the vector kernel is revisited anyway: hold the codebook
+lane-resident and read it via `__shfl_sync` instead of memory, and check whether
+the XOR-16 shuffle stage lowers to `ds_bpermute` (it crosses the DPP16 row
+boundary on RDNA 4).
 
 ### Perplexity (lower is better)
 
