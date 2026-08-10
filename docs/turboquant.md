@@ -56,10 +56,14 @@ an operand is a turbo type — unverified, worth a look with `GGML_CUDA_DEBUG`.
 KV cache at 131072 context, 8 attention layers (Qwen3.5 is hybrid — the other
 24 layers are linear attention with a constant-size recurrent state):
 
-| KV Type | KV cache size |
-|---------|--------------|
-| f16 | 4096 MiB (computed) |
-| turbo3 | 896 MiB (measured) |
+| KV Type | KV cache | Total VRAM | Savings |
+|---------|----------|-----------|---------|
+| f16 | 4096 MiB | 14.81 GB | — |
+| turbo4 | 1152 MiB | 11.75 GB | 72% |
+| turbo3 | 896 MiB | 11.47 GB | 78% |
+
+At 131072 context f16 needs 14.81 GB of the card's 16.3 GB, leaving almost no
+headroom for the vision encoder. turbo3 brings that down to 11.47 GB.
 
 ### Perplexity (lower is better)
 
@@ -77,11 +81,13 @@ Qwen3.5-9B Q8_0 (head_dim 256), 600KB C++ corpus, context=2048:
 | KV Type | PPL | Delta vs f16 |
 |---------|-----|-------------|
 | f16 | 1.5258 ± 0.0071 | — |
-| turbo4 | not yet measured | — |
-| turbo3 | not yet measured | — |
+| turbo4 | 1.5281 ± 0.0071 | +0.002 |
+| turbo3 | 1.5343 ± 0.0072 | +0.009 |
 
-The turbo runs aborted with an out-of-memory error because another llama-server
-instance held the GPU. Rerun with the GPU idle to complete the table.
+Both deltas are markedly smaller than at head_dim 128 (+0.010 / +0.051). Splitting
+a 256-dim head into two independently normalized halves stores two norms instead
+of one, which tracks variance differences between the halves more closely — at no
+extra cost, since the norm is replicated per block either way.
 
 ### KV Cache Memory
 
