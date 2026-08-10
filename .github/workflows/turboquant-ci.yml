@@ -67,8 +67,9 @@ jobs:
         with:
           cuda: "12.6.2"
           method: network
-          # ggml-cuda links against cuBLAS, so nvcc and the runtime alone are not enough.
-          sub-packages: '["nvcc", "cudart-dev", "cublas", "cublas-dev"]'
+          # No sub-packages filter: ggml-cuda needs cuBLAS in addition to nvcc and
+          # the runtime, and guessing package names cost two failed runs. A full
+          # install is slower but does not break on naming.
 
       - name: Install dependencies
         run: |
