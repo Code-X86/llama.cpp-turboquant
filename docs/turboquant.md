@@ -87,9 +87,34 @@ a per-cache bulk conversion predicts.
 Prompt processing is unaffected (turbo is in fact faster there, 1012 vs 730 t/s at
 d65536) because the single conversion amortizes over the whole batch.
 
-A fused kernel that decodes turbo blocks inside flash attention would remove this
-conversion entirely; that is the motivation for the work tracked in
-docs/superpowers/specs/2026-08-10-turboquant-head-dim-256-design.md.
+### Fused kernel: implemented, correct, currently slower
+
+A fused vector kernel that decodes turbo blocks inside flash attention exists
+(`fattn-vec-turbo.cuh`). It removes the bulk conversion entirely by working in
+the Hadamard domain — Q is transformed once at kernel start, V is accumulated
+untransformed and transformed once at the end, so two transforms per launch
+replace two per KV token.
+
+It is correct (test-backend-ops FLASH_ATTN_EXT: turbo3 640/640, turbo4 640/640)
+but **slower than the path it replaces**, measured A/B in the same build:
+
+| depth | fused | bulk conversion | f16 |
+|-------|-------|-----------------|-----|
+| 0 | 52.5 | 55.0 | 56.8 |
+| 16384 | 35.7 | 42.5 | 54.1 |
+| 65536 | **16.6** | **23.6** | **46.9** |
+
+It saves memory bandwidth but pays for it in per-token work: unpacking 3-bit
+indices across byte boundaries and looking up codebook entries. On AMD a
+`__constant__` array is a real vector load, not a broadcast from a constant
+bank, so each lane issues 4 loads per KV token per chunk. That cost apparently
+outweighs the bandwidth saved — plausible but not verified; an ISA-level look at
+the generated loads and the cross-lane shuffles would be the next step.
+
+Therefore **disabled by default**. Enable with `GGML_CUDA_TURBO_FUSED_FA=1`.
+Ideas worth trying before revisiting: keep the codebook lane-resident and read it
+via `__shfl_sync` instead of memory, and check whether the XOR-16 shuffle stage
+compiles to `ds_bpermute` (it crosses the DPP16 row boundary on RDNA 4).
 
 ### Perplexity (lower is better)
 

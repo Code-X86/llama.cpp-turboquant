@@ -539,9 +539,11 @@ static bool ggml_cuda_fattn_turbo_fused_applies(const ggml_tensor * dst) {
         return false;
     }
 
-    // Escape hatch for the field.
-    static const bool disabled = getenv("GGML_CUDA_TURBO_FUSED_FA_OFF") != nullptr;
-    return !disabled;
+    // Off by default: measured slower than the bulk-conversion path it replaces
+    // (16.6 vs 23.6 t/s at depth 65536 on gfx1201, see docs/turboquant.md).
+    // Correct, but not yet worth enabling. Opt in with GGML_CUDA_TURBO_FUSED_FA=1.
+    static const bool enabled = getenv("GGML_CUDA_TURBO_FUSED_FA") != nullptr;
+    return enabled;
 }
 
 static void ggml_cuda_flash_attn_ext_vec_turbo(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
