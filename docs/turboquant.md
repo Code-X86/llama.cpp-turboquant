@@ -288,6 +288,28 @@ The ranking is model-specific — it was measured on this model and should not b
 assumed to transfer. Reproduce it for another model by upgrading one layer at a
 time, as above.
 
+#### K and V are equally sensitive
+
+Layers are not the only axis a bit budget can be spent on: `--cache-type-k` and
+`--cache-type-v` have always allowed K and V to differ. Work on KV quantization
+usually finds K the more sensitive of the two, because outlier channels
+concentrate there. At the same 4.0 bpw:
+
+| allocation | PPL |
+|------------|-----|
+| K=turbo4, V=turbo3 | 1.5319 |
+| K=turbo3, V=turbo4 | 1.5317 |
+| per-layer, best four | 1.5292 |
+
+0.0002 separates the two directions — noise. There is no K/V asymmetry to exploit
+here, which is what the Hadamard transform is for: every output is a signed sum of
+all 128 inputs, so a single outlier channel is spread across the whole vector
+instead of dominating one dimension. The asymmetry other methods exploit has
+already been flattened.
+
+So the layer axis is the productive one. It beats either K/V split by 0.0026 at
+identical cost, five times the noise floor.
+
 ### KV Cache Memory
 
 | KV Type | Bytes per element | Savings vs f16 |
