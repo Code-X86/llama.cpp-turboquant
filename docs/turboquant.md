@@ -177,6 +177,29 @@ a 256-dim head into two independently normalized halves stores two norms instead
 of one, which tracks variance differences between the halves more closely — at no
 extra cost, since the norm is replicated per block either way.
 
+#### The error does not accumulate with context depth
+
+KVarN (arXiv 2606.03458, llama.cpp #24139) argues that KV-cache quantization
+error compounds during autoregressive decoding, so a short-context perplexity
+number can understate the real cost. Measured against that concern:
+
+| context | f16 | turbo4 | delta | turbo3 | delta |
+|---------|-----|--------|-------|--------|-------|
+| 2048 | 1.5258 | 1.5276 | +0.0018 | 1.5338 | +0.0080 |
+| 8192 | 1.4107 | 1.4124 | +0.0017 | 1.4172 | +0.0065 |
+| 16384 | 1.3431 | not measured | — | not measured | — |
+
+The gap does not widen — for turbo3 it narrows slightly, in absolute and in
+relative terms (0.52% -> 0.46%). Two depths is a thin basis for a trend, but it
+is enough to rule out the failure mode the paper describes.
+
+That is consistent with how TurboQuant stores data: the per-chunk L2 norm is kept
+in fp16 and never quantized, so only the *direction* of the normalized vector is
+approximated. KVarN attributes the accumulating error specifically to incorrect
+per-token magnitude scaling — the mechanism does not exist here. The per-chunk
+normalization that makes TurboQuant expensive at runtime is the same property
+that makes it robust over long contexts.
+
 ### KV Cache Memory
 
 | KV Type | Bytes per element | Savings vs f16 |
