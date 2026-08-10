@@ -513,6 +513,14 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_turbo_k(
     // two threads write the two halves would be a read-modify-write race.
     constexpr int JP = std::is_same<tile_t, half2>::value ? J/2 : J;
 
+    // J == 0 is instantiated for the empty trailing block. Bail out before the
+    // divisions below — the compiler evaluates them at compile time and rejects
+    // the division by zero under -Werror even though the loop never executes.
+    if constexpr (JP == 0) {
+        GGML_UNUSED_VARS(KV, tile_KV, stride_KV_b, i_sup, elem_off);
+        return;
+    } else {
+
 #pragma unroll
     for (int idx0 = 0; idx0 < I*JP; idx0 += nthreads) {
         const int idx = idx0 + tid;
@@ -546,6 +554,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_turbo_k(
         } else {
             tile_KV[i*(J + J_padding) + jp] = fetch(jp);
         }
+    }
     }
 }
 
