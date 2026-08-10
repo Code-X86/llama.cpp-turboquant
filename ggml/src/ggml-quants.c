@@ -749,6 +749,30 @@ void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGM
 }
 
 // ============================================================
+// TurboQuant chunked quantization entry points
+// ============================================================
+//
+// Row-major wrappers used by ggml_quantize_chunk. The FWHT runs over fixed
+// 128-element chunks, so a row must be a multiple of TURBO_HEAD_DIM — otherwise
+// a chunk would straddle two rows and mix their values.
+
+size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // not used
+    GGML_ASSERT(n_per_row % TURBO_HEAD_DIM == 0);
+    const size_t row_size = ggml_row_size(GGML_TYPE_TURBO3_0, n_per_row);
+    quantize_row_turbo3_0_ref(src, (block_turbo3_0 *)dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights; // not used
+    GGML_ASSERT(n_per_row % TURBO_HEAD_DIM == 0);
+    const size_t row_size = ggml_row_size(GGML_TYPE_TURBO4_0, n_per_row);
+    quantize_row_turbo4_0_ref(src, (block_turbo4_0 *)dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+// ============================================================
 // TurboQuant vec_dot (for flash attention compatibility)
 // ============================================================
 

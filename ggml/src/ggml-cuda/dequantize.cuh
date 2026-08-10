@@ -1,3 +1,5 @@
+#pragma once
+
 #include "common.cuh"
 
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int64_t ib, const int iqs, float2 & v){

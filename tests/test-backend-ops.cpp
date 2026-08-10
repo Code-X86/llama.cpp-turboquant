@@ -109,6 +109,12 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         {
             // parallel quantization by block
             size_t blck_size = ggml_blck_size(tensor->type);
+            if (tensor->type == GGML_TYPE_TURBO3_0 || tensor->type == GGML_TYPE_TURBO4_0) {
+                // TurboQuant normalizes and rotates whole 128-element chunks, so a
+                // quantization call has to cover one — the 32-element block size would
+                // split a chunk across calls and produce garbage.
+                blck_size = 128;
+            }
             size_t n_blocks = nels / blck_size;
 
             auto quantize_thread = [&](size_t start, size_t end) {
@@ -8610,8 +8616,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                             for (int nb : { 1, 3, 32, 75, }) {
                                                 for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                     if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
-                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
-                                                        if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72) continue;
+                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+                                                        const bool is_turbo = type_KV == GGML_TYPE_TURBO3_0 || type_KV == GGML_TYPE_TURBO4_0;
+                                                        // TurboQuant applies the FWHT over 128-element chunks, so head_dim
+                                                        // must be a multiple of 128 — but it is not limited to 64/72 like
+                                                        // the other quantized KV types.
+                                                        if (is_turbo && (hsk % 128 != 0 || hsv % 128 != 0)) continue;
+                                                        if (!is_turbo && type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72) continue;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
                                                                     hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV));
                                                         // run fewer test cases permuted

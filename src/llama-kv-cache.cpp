@@ -132,19 +132,22 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
-        // TurboQuant requires head_dim=128 for the FWHT transform
+        // TurboQuant applies the FWHT in fixed 128-element chunks, so head_dim
+        // must be a multiple of 128. A 256-dim head is quantized as two
+        // independently normalized halves — each half is a unit vector in R^128,
+        // which is the distribution the codebooks were fitted for.
         if (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0) {
             const uint32_t n_embd_head_k = hparams.n_embd_head_k(il);
-            if (n_embd_head_k != 128) {
-                LLAMA_LOG_ERROR("%s: TurboQuant requires head_dim=128, got %d (layer %d)\n", __func__, n_embd_head_k, il);
-                throw std::runtime_error("turbo types require head_dim=128");
+            if (n_embd_head_k % 128 != 0) {
+                LLAMA_LOG_ERROR("%s: TurboQuant requires head_dim to be a multiple of 128, got %d (layer %d)\n", __func__, n_embd_head_k, il);
+                throw std::runtime_error("turbo types require head_dim to be a multiple of 128");
             }
         }
         if (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0) {
             const uint32_t n_embd_head_v = hparams.n_embd_head_v(il);
-            if (n_embd_head_v != 128) {
-                LLAMA_LOG_ERROR("%s: TurboQuant requires head_dim=128, got %d (layer %d)\n", __func__, n_embd_head_v, il);
-                throw std::runtime_error("turbo types require head_dim=128");
+            if (n_embd_head_v % 128 != 0) {
+                LLAMA_LOG_ERROR("%s: TurboQuant requires head_dim to be a multiple of 128, got %d (layer %d)\n", __func__, n_embd_head_v, il);
+                throw std::runtime_error("turbo types require head_dim to be a multiple of 128");
             }
         }
 
