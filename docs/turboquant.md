@@ -35,6 +35,32 @@ All benchmarks: Qwen3-14B Q4_K_M, AMD RX 9070 XT (16 GB VRAM, gfx1201), ROCm 6.1
 | **turbo4/turbo4** | **1812** | **1816** | **1321** | **926** | **550** | **460** | **49.3** | **4.5** |
 | **turbo3/turbo3** | **1836** | **1816** | **1319** | **924** | **548** | — | **49.6** | **3.5** |
 
+### Throughput — Qwen3.5-9B Q8_0 (head_dim 256)
+
+RX 9070 XT, `-fa 1 -ngl 99`, 2 runs each. Note the reversed picture compared to
+head_dim 128: turbo is substantially *faster* at prompt processing here.
+
+| type_k | type_v | pp512 | tg128 |
+|--------|--------|-------|-------|
+| f16 | f16 | 2565 ± 175 | 56.4 |
+| f16 | turbo4 | 4084 ± 118 | 55.8 |
+| turbo4 | turbo4 | 3929 ± 34 | 55.3 |
+| turbo4 | f16 | 3981 ± 28 | 55.7 |
+| turbo3 | turbo3 | 3933 ± 25 | 55.2 |
+| turbo3 | f16 | 3966 ± 17 | 55.9 |
+
+Any turbo operand lifts pp512 by ~53% over f16/f16 while token generation stays
+flat. The likely cause is a different flash-attention kernel being selected once
+an operand is a turbo type — unverified, worth a look with `GGML_CUDA_DEBUG`.
+
+KV cache at 131072 context, 8 attention layers (Qwen3.5 is hybrid — the other
+24 layers are linear attention with a constant-size recurrent state):
+
+| KV Type | KV cache size |
+|---------|--------------|
+| f16 | 4096 MiB (computed) |
+| turbo3 | 896 MiB (measured) |
+
 ### Perplexity (lower is better)
 
 Measured on ~960KB C++ source code corpus, context=2048.
@@ -45,6 +71,17 @@ Measured on ~960KB C++ source code corpus, context=2048.
 | q8_0 | 1.7044 | +0.001 |
 | turbo4 | 1.7134 | +0.010 |
 | turbo3 | 1.7544 | +0.051 |
+
+Qwen3.5-9B Q8_0 (head_dim 256), 600KB C++ corpus, context=2048:
+
+| KV Type | PPL | Delta vs f16 |
+|---------|-----|-------------|
+| f16 | 1.5258 ± 0.0071 | — |
+| turbo4 | not yet measured | — |
+| turbo3 | not yet measured | — |
+
+The turbo runs aborted with an out-of-memory error because another llama-server
+instance held the GPU. Rerun with the GPU idle to complete the table.
 
 ### KV Cache Memory
 
