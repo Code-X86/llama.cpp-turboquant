@@ -65,6 +65,32 @@ KV cache at 131072 context, 8 attention layers (Qwen3.5 is hybrid — the other
 At 131072 context f16 needs 14.81 GB of the card's 16.3 GB, leaving almost no
 headroom for the vision encoder. turbo3 brings that down to 11.47 GB.
 
+### Token generation degrades with context depth
+
+The pre-dequantize strategy converts the whole KV cache to f16 once per FA call.
+That cost is O(n_kv) per generated token, so it grows with context depth while the
+attention work per token stays flat. Measured on Qwen3.5-9B Q8_0, RX 9070 XT:
+
+| type_k | type_v | tg128 @ d0 | tg128 @ d16384 | tg128 @ d65536 |
+|--------|--------|-----------|---------------|---------------|
+| f16 | f16 | 56.8 | 54.1 | **46.9** |
+| f16 | turbo4 | 55.9 | 48.0 | 32.3 |
+| f16 | turbo3 | 56.1 | 47.3 | 31.5 |
+| turbo4 | f16 | 55.7 | 48.0 | 32.5 |
+| turbo3 | f16 | 56.4 | 48.2 | 31.9 |
+| turbo3 | turbo4 | 55.9 | 43.1 | **24.5** |
+
+One quantized cache costs ~32 t/s at depth 65536, two cost ~24.5, f16 gets 46.9.
+The penalty tracks the *number* of converted caches, not which one — exactly what
+a per-cache bulk conversion predicts.
+
+Prompt processing is unaffected (turbo is in fact faster there, 1012 vs 730 t/s at
+d65536) because the single conversion amortizes over the whole batch.
+
+A fused kernel that decodes turbo blocks inside flash attention would remove this
+conversion entirely; that is the motivation for the work tracked in
+docs/superpowers/specs/2026-08-10-turboquant-head-dim-256-design.md.
+
 ### Perplexity (lower is better)
 
 Measured on ~960KB C++ source code corpus, context=2048.

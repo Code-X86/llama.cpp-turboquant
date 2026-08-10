@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "turbo.cuh"
 
 #include <cstdint>
 
@@ -666,90 +667,6 @@ static void dequantize_row_nvfp4_cuda(
 // Step 2: FWHT butterfly in shared memory (7 stages for n=128)
 // Step 3: normalize by 1/sqrt(128) and scale by stored norm
 // Step 4: write to output
-
-#define TURBO_HEAD_DIM_GPU 128
-#define TURBO_BLOCKS_PER_CHUNK_GPU (TURBO_HEAD_DIM_GPU / 32)  // 4
-
-// 1/sqrt(128) — the FWHT normalization, matching turbo_fwht_f32 in ggml-quants.c
-#define TURBO_FWHT_SCALE_GPU 0.08838834764831844f
-
-// Unpack one 3-bit codebook index. Mirrors turbo_unpack3 in ggml-quants.c.
-static __device__ __forceinline__ uint8_t turbo3_unpack_index(const block_turbo3_0 * x, int elem_in_block) {
-    const uint8_t * qs = x->qs;
-
-    const int bit_off  = elem_in_block * 3;
-    const int byte_idx = bit_off / 8;
-    const int shift    = bit_off % 8;
-
-    uint16_t raw = (uint16_t)qs[byte_idx] >> shift;
-    if (shift > 5 && byte_idx + 1 < 12) {
-        raw |= (uint16_t)qs[byte_idx + 1] << (8 - shift);
-    }
-    return (uint8_t)(raw & 0x07);
-}
-
-static __device__ __forceinline__ uint8_t turbo4_unpack_index(const block_turbo4_0 * x, int elem_in_block) {
-    const uint8_t packed = x->qs[elem_in_block / 2];
-    return (elem_in_block & 1) ? ((packed >> 4) & 0x0F) : (packed & 0x0F);
-}
-
-// In-place inverse FWHT over 128 shared-memory floats, 7 butterfly stages.
-// All 128 threads of the block must call this. The stage order and the pairing
-// (i, i+h) are deliberately identical to turbo_fwht_f32 in ggml-quants.c so that
-// both paths produce the same rounding.
-static __device__ __forceinline__ void turbo_fwht_smem_128(float * smem, int tid) {
-    for (int h = 1; h < TURBO_HEAD_DIM_GPU; h *= 2) {
-        if (tid < TURBO_HEAD_DIM_GPU/2) {
-            const int group = tid / h;
-            const int pos   = tid % h;
-            const int i     = group * h * 2 + pos;
-            const float a = smem[i];
-            const float b = smem[i + h];
-            smem[i]     = a + b;
-            smem[i + h] = a - b;
-        }
-        __syncthreads();
-    }
-}
-
-// Decode one 128-element chunk starting at block index ib_chunk into smem[tid].
-// Leaves the fully reconstructed value in smem[tid]; the caller writes it out.
-template <typename block_t>
-static __device__ __forceinline__ void turbo_decode_chunk_smem(
-        const block_t * blocks, int64_t ib_chunk, float * smem, int tid);
-
-template <>
-__device__ __forceinline__ void turbo_decode_chunk_smem<block_turbo3_0>(
-        const block_turbo3_0 * blocks, int64_t ib_chunk, float * smem, int tid) {
-    const int local_block   = tid / TURBO3_BLOCK_SIZE;
-    const int elem_in_block = tid % TURBO3_BLOCK_SIZE;
-
-    smem[tid] = dc_codebook_3bit[turbo3_unpack_index(blocks + ib_chunk + local_block, elem_in_block)];
-    __syncthreads();
-
-    turbo_fwht_smem_128(smem, tid);
-
-    // The norm is replicated in every block of the chunk; read it from the first.
-    const float norm = __half2float(blocks[ib_chunk].d);
-    smem[tid] *= TURBO_FWHT_SCALE_GPU * norm;
-    __syncthreads();
-}
-
-template <>
-__device__ __forceinline__ void turbo_decode_chunk_smem<block_turbo4_0>(
-        const block_turbo4_0 * blocks, int64_t ib_chunk, float * smem, int tid) {
-    const int local_block   = tid / TURBO4_BLOCK_SIZE;
-    const int elem_in_block = tid % TURBO4_BLOCK_SIZE;
-
-    smem[tid] = dc_codebook_4bit[turbo4_unpack_index(blocks + ib_chunk + local_block, elem_in_block)];
-    __syncthreads();
-
-    turbo_fwht_smem_128(smem, tid);
-
-    const float norm = __half2float(blocks[ib_chunk].d);
-    smem[tid] *= TURBO_FWHT_SCALE_GPU * norm;
-    __syncthreads();
-}
 
 template <typename dst_t>
 static __global__ void dequantize_block_turbo3_0_kernel(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
