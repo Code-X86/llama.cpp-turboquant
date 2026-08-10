@@ -123,35 +123,44 @@ recovers this; a fused kernel has to support GQA to beat the tile path.
 
 Therefore **disabled by default**. Enable with `GGML_CUDA_TURBO_FUSED_FA=1`.
 
-### Fused tile V path: also no gain
+### Fused tile path: K and V decoded inside attention
 
-The tile kernel is what f16 actually uses for decode with GQA, and its V tile
-holds complete contiguous head_dim rows, so decoding there avoids the vector
-kernel's GQA penalty entirely. That path exists too (`type_V` threaded through
-`flash_attn_tile`, `flash_attn_tile_load_tile_turbo`, `need_f16_V = false`) and
-is correct — 640/640 on both turbo types. It does not help either, at depth 65536:
+The tile kernel is what f16 uses for decode with GQA, so decoding there avoids
+the vector kernel's GQA penalty. Both sides are now fused (`type_K`/`type_V`
+threaded through `flash_attn_tile` / `_iter` / `_iter_KQ`, `need_f16_K/V = false`).
 
-| config | bulk | fused V |
-|--------|------|---------|
-| f16 / turbo3 | 31.46 | 31.08 |
-| turbo3 / turbo3 | 23.58 | 23.54 |
+The decisive detail is *where* the Hadamard transform happens. A first version
+decoded each chunk as it was loaded — one inverse FWHT per KV token, the same
+O(n_kv) cost as the bulk conversion, just relocated. It measured exactly as fast
+as what it replaced. Working in the Hadamard domain instead reduces that to O(1):
 
-Traffic does drop from 2 to 0.4375 bytes per element. The kernel is not waiting
-on that. The original tile load is a plain copy, fully pipelined across all
-threads; decoding instead walks chunk by chunk through an FWHT whose five shuffle
-stages form a dependency chain. It is latency-bound, not bandwidth-bound.
+  V:  sum_j p_j H c_j = H (sum_j p_j c_j)   accumulate raw, transform once at the end
+  K:  <H c, q> = <c, H q>                   transform Q once at kernel start
 
-**Conclusion after two independent attempts:** TurboQuant decoding is too
-expensive to perform inside attention. The bulk conversion amortizes it over the
-whole cache once per FA call, which neither a vector nor a tile kernel can match
-by decoding on demand. The fused tile V path is kept because it removes the f16
-staging buffer for V (~128 MB at 65536 context) at no throughput cost.
+tg128 at depth 65536, Qwen3.5-9B Q8_0 on gfx1201:
 
-If this is revisited, the thing to attack is the decode cost itself, not where it
-runs: hold the codebook lane-resident and read it via `__shfl_sync` instead of
-memory, and check whether the XOR-16 shuffle stage lowers to `ds_bpermute` (it
-crosses the DPP16 row boundary on RDNA 4). Both target the dependency chain that
-makes decoding slow in the first place.
+| stage | t/s | of f16 |
+|-------|-----|--------|
+| bulk conversion (baseline) | 23.58 | 0.50x |
+| V fused | 26.62 | 0.57x |
+| K and V fused | **29.59** | **0.63x** |
+| f16 reference | 46.90 | 1.00x |
+
+0.63x matches what llama.cpp discussion #20969 reports for quantized KV at 110K
+context. Quantized KV is slower than f16 at decode across methods and backends —
+that is a property of the approach, not of this implementation. What was
+recoverable has been recovered.
+
+Two bugs worth recording, both found by the test matrix rather than by reading:
+
+- The K tile loader assumed a slice narrower than one 128-element chunk. True for
+  `nbatch_K = 64`, false for 128 and 256, which the config table also selects.
+  The chunk (and its norm) is now derived per element.
+- Staging all of Q for the transform needed `ncols*DKQ` floats in `KV_tmp`, which
+  is sized by `nbatch_fa*nbatch_K` — and those shrink as `ncols` grows. At
+  `ncols=64` the buffer was short by a factor of 1.8. Transforming one chunk at a
+  time needs 128 floats regardless of `ncols`. This is why only large batches
+  failed while `nb=1` stayed green.
 
 ### Perplexity (lower is better)
 

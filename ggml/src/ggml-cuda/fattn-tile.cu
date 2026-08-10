@@ -17,16 +17,16 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
         switch (K->ne[0]) {
             case 128:
                 if (V->type == GGML_TYPE_TURBO3_0) {
-                    ggml_cuda_flash_attn_ext_tile_case<128, 128, GGML_TYPE_F16, GGML_TYPE_TURBO3_0>(ctx, dst);
+                    ggml_cuda_flash_attn_ext_tile_case<128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst);
                 } else {
-                    ggml_cuda_flash_attn_ext_tile_case<128, 128, GGML_TYPE_F16, GGML_TYPE_TURBO4_0>(ctx, dst);
+                    ggml_cuda_flash_attn_ext_tile_case<128, 128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst);
                 }
                 return;
             case 256:
                 if (V->type == GGML_TYPE_TURBO3_0) {
-                    ggml_cuda_flash_attn_ext_tile_case<256, 256, GGML_TYPE_F16, GGML_TYPE_TURBO3_0>(ctx, dst);
+                    ggml_cuda_flash_attn_ext_tile_case<256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>(ctx, dst);
                 } else {
-                    ggml_cuda_flash_attn_ext_tile_case<256, 256, GGML_TYPE_F16, GGML_TYPE_TURBO4_0>(ctx, dst);
+                    ggml_cuda_flash_attn_ext_tile_case<256, 256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>(ctx, dst);
                 }
                 return;
             default:

@@ -1046,50 +1046,55 @@ static __global__ void flash_attn_tile(
     if constexpr (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0) {
         static_assert(DKQ % TURBO_HEAD_DIM_GPU == 0, "turbo needs DKQ to be a multiple of 128");
         constexpr int nthreads_blk = warp_size*nwarps;
-        constexpr int nchunks_Q    = ncols * (DKQ / TURBO_HEAD_DIM_GPU);
+        constexpr int chunks_per_col = DKQ / TURBO_HEAD_DIM_GPU;
 
+        // One chunk at a time: the scratch then needs 128 floats regardless of
+        // ncols. Staging all of Q at once would need ncols*DKQ floats, which
+        // outgrows KV_tmp as ncols rises (KV_tmp scales with nbatch_fa*nbatch_K,
+        // and those shrink as ncols grows).
         float * Qs = (float *) KV_tmp;
         const int tid_blk = warp_size*threadIdx.y + threadIdx.x;
 
 #pragma unroll
-        for (int idx0 = 0; idx0 < ncols*DKQ; idx0 += nthreads_blk) {
-            const int idx = idx0 + tid_blk;
-            if (ncols*DKQ % nthreads_blk != 0 && idx >= ncols*DKQ) {
-                continue;
-            }
-            const int jc = idx / DKQ;
-            const int i  = idx % DKQ;
-#ifdef FAST_FP16_AVAILABLE
-            const half2 h = Q_tmp[jc*(DKQ/2) + i/2];
-            Qs[idx] = (i % 2 == 0) ? __half2float(__low2half(h)) : __half2float(__high2half(h));
-#else
-            Qs[idx] = Q_tmp[jc*DKQ + i];
-#endif // FAST_FP16_AVAILABLE
-        }
-        __syncthreads();
+        for (int jc = 0; jc < ncols; ++jc) {
+#pragma unroll
+            for (int ch = 0; ch < chunks_per_col; ++ch) {
+                const int base = ch*TURBO_HEAD_DIM_GPU;
 
 #pragma unroll
-        for (int c = 0; c < nchunks_Q; ++c) {
-            turbo_fwht_smem_128_n<nthreads_blk>(Qs + c*TURBO_HEAD_DIM_GPU, tid_blk);
-        }
+                for (int e0 = 0; e0 < TURBO_HEAD_DIM_GPU; e0 += nthreads_blk) {
+                    const int e = e0 + tid_blk;
+                    if (nthreads_blk > TURBO_HEAD_DIM_GPU && e >= TURBO_HEAD_DIM_GPU) {
+                        continue;
+                    }
+#ifdef FAST_FP16_AVAILABLE
+                    const half2 h = Q_tmp[jc*(DKQ/2) + (base + e)/2];
+                    Qs[e] = ((base + e) % 2 == 0) ? __half2float(__low2half(h)) : __half2float(__high2half(h));
+#else
+                    Qs[e] = Q_tmp[jc*DKQ + base + e];
+#endif // FAST_FP16_AVAILABLE
+                }
+                __syncthreads();
+
+                turbo_fwht_smem_128_n<nthreads_blk>(Qs, tid_blk);
 
 #pragma unroll
-        for (int idx0 = 0; idx0 < ncols*DKQ; idx0 += nthreads_blk) {
-            const int idx = idx0 + tid_blk;
-            if (ncols*DKQ % nthreads_blk != 0 && idx >= ncols*DKQ) {
-                continue;
-            }
-            const int jc = idx / DKQ;
-            const int i  = idx % DKQ;
+                for (int e0 = 0; e0 < TURBO_HEAD_DIM_GPU; e0 += nthreads_blk) {
+                    const int e = e0 + tid_blk;
+                    if (nthreads_blk > TURBO_HEAD_DIM_GPU && e >= TURBO_HEAD_DIM_GPU) {
+                        continue;
+                    }
 #ifdef FAST_FP16_AVAILABLE
-            if (i % 2 == 0) {
-                Q_tmp[jc*(DKQ/2) + i/2] = make_half2(Qs[idx], Qs[idx + 1]);
-            }
+                    if ((base + e) % 2 == 0) {
+                        Q_tmp[jc*(DKQ/2) + (base + e)/2] = make_half2(Qs[e], Qs[e + 1]);
+                    }
 #else
-            Q_tmp[jc*DKQ + i] = Qs[idx];
+                    Q_tmp[jc*DKQ + base + e] = Qs[e];
 #endif // FAST_FP16_AVAILABLE
+                }
+                __syncthreads();
+            }
         }
-        __syncthreads();
     }
 
     // Main loop over KV cache:
@@ -1505,11 +1510,9 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
     template void ggml_cuda_flash_attn_ext_tile_case              \
     <DKQ, DV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
 
-// K stays on the conversion path for now — the fused K variant is correct for
-// small batches but fails for nb >= 32, see docs/turboquant.md.
-#define DECL_FATTN_TILE_CASE_TURBO(DKQ, DV, TYPE_KV)                                         \
-    template void ggml_cuda_flash_attn_ext_tile_case                                         \
-    <DKQ, DV, GGML_TYPE_F16, TYPE_KV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)    \
+#define DECL_FATTN_TILE_CASE_TURBO(DKQ, DV, TYPE_KV)                                  \
+    template void ggml_cuda_flash_attn_ext_tile_case                                  \
+    <DKQ, DV, TYPE_KV, TYPE_KV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)   \
 
 extern DECL_FATTN_TILE_CASE( 40,  40);
 extern DECL_FATTN_TILE_CASE( 64,  64);
