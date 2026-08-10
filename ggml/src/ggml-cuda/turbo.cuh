@@ -150,6 +150,74 @@ __device__ __forceinline__ void turbo_decode_chunk_smem<block_turbo4_0>(
 }
 
 // ------------------------------------------------------------
+// Chunk decode with an arbitrary thread count
+// ------------------------------------------------------------
+//
+// The tile kernel runs with fewer threads than the 128 a chunk has elements
+// (64 for head_dim 256 on RDNA), so the fixed one-thread-per-element form above
+// does not fit. This variant strides over the chunk instead. The butterfly
+// stages keep the same order and operand order, so results stay bit-identical
+// to turbo_fwht_smem_128.
+//
+// All nthreads threads of the block must call this; it synchronizes internally.
+
+template <int nthreads>
+static __device__ __forceinline__ void turbo_fwht_smem_128_n(float * smem, int tid) {
+    for (int h = 1; h < TURBO_HEAD_DIM_GPU; h *= 2) {
+#pragma unroll
+        for (int b0 = 0; b0 < TURBO_HEAD_DIM_GPU/2; b0 += nthreads) {
+            const int b = b0 + tid;
+            if (nthreads >= TURBO_HEAD_DIM_GPU/2 && b >= TURBO_HEAD_DIM_GPU/2) {
+                continue;
+            }
+            const int group = b / h;
+            const int pos   = b % h;
+            const int i     = group * h * 2 + pos;
+            const float a = smem[i];
+            const float c = smem[i + h];
+            smem[i]     = a + c;
+            smem[i + h] = a - c;
+        }
+        __syncthreads();
+    }
+}
+
+template <typename block_t, int nthreads>
+static __device__ __forceinline__ void turbo_decode_chunk_smem_n(
+        const block_t * blocks, int64_t ib_chunk, float * smem, int tid) {
+    constexpr int bs = (sizeof(block_t) == sizeof(block_turbo3_0)) ? TURBO3_BLOCK_SIZE : TURBO4_BLOCK_SIZE;
+
+#pragma unroll
+    for (int e0 = 0; e0 < TURBO_HEAD_DIM_GPU; e0 += nthreads) {
+        const int e = e0 + tid;
+        if (nthreads >= TURBO_HEAD_DIM_GPU && e >= TURBO_HEAD_DIM_GPU) {
+            continue;
+        }
+        const int blk = e / bs;
+        const int eib = e % bs;
+        if constexpr (sizeof(block_t) == sizeof(block_turbo3_0)) {
+            smem[e] = dc_codebook_3bit[turbo3_unpack_index((const block_turbo3_0 *)(blocks + ib_chunk + blk), eib)];
+        } else {
+            smem[e] = dc_codebook_4bit[turbo4_unpack_index((const block_turbo4_0 *)(blocks + ib_chunk + blk), eib)];
+        }
+    }
+    __syncthreads();
+
+    turbo_fwht_smem_128_n<nthreads>(smem, tid);
+
+    const float scale = TURBO_FWHT_SCALE_GPU * __half2float(blocks[ib_chunk].d);
+#pragma unroll
+    for (int e0 = 0; e0 < TURBO_HEAD_DIM_GPU; e0 += nthreads) {
+        const int e = e0 + tid;
+        if (nthreads >= TURBO_HEAD_DIM_GPU && e >= TURBO_HEAD_DIM_GPU) {
+            continue;
+        }
+        smem[e] *= scale;
+    }
+    __syncthreads();
+}
+
+// ------------------------------------------------------------
 // Chunk decode into registers (one warp per chunk)
 // ------------------------------------------------------------
 //
